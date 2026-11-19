@@ -430,8 +430,10 @@
 
 local CFG = {
     ToggleKey   = Enum.KeyCode.RightShift,
-    AutoSolve   = false,   -- do NOT farm the QTE on load: casting a domain is
-                           -- the player's decision, not a side effect of loading
+    AutoSolve   = false,   -- do NOT start the solver on load. it only ever
+                           -- reacts to a minigame that is already on screen,
+                           -- but a hub that starts solving the moment it loads
+                           -- is still a side effect the player did not ask for
     WaitForQTE  = 26,      -- seconds to wait for the minigame
     TargetPts   = 22,      -- Points needed for a full gauge
     SpeedToRate = 0.62,    -- Config.Speed -> bar/s, measured on live trials
@@ -2033,36 +2035,24 @@ local function pressEntry(entry)
         return
     end
 
-    if entry.spec.qte and CFG.AutoSolve then
-        -- AUTO QTE OWNS THIS TOWER, NOT "THE FARM HAPPENS TO BE ROTATING".
-        -- The farm casts the domain and solves every minigame it opens, so a
-        -- press from the auto-cast loop is a second domain 1.2s later: the
-        -- server refuses it and the log fills with `no QTE: server refused`.
+    if entry.spec.qte and Solver.farming then
+        -- A FARM ROTATION OWNS THIS TOWER WHILE IT IS ROTATING.
+        -- Only the FARM button and Auto Win rotate now; AUTO QTE itself never
+        -- casts, it only solves what appears. But a rotation does cast this
+        -- domain, so a press from the auto-cast loop is a second cast 1.2s
+        -- later, which the server refuses and the log records as
+        -- `no QTE: server refused`.
         --
-        -- Two earlier versions of this guard were both wrong in opposite
-        -- directions. The first asked "is a driver thread alive", which was
-        -- false whenever the driver had died - and it died constantly, see the
-        -- generation comment in startAuto - so in "selected" mode the picked
-        -- tower stopped casting entirely. The second narrowed it to
-        -- Solver.farming, which is only set during a rotation, so the auto-cast
-        -- loop got a free hand in every 2..30s pause between rotations: it
-        -- pressed the tower, solveOnce bumped the shared token, and the farm
-        -- exited for good. That is the "one or two minigames and then nothing".
-        --
-        -- Ownership is the right question, not liveness: while the toggle is on,
-        -- a live driver means the farm is responsible for this tower, full
-        -- stop. "Is a driver alive" only became a usable test once the driver
-        -- stopped dying on every token bump and the supervisor started putting
-        -- it back - before that the same test was reading a dead flag.
-        if Solver.driver then
-            if Hub.setStatus then Hub.setStatus("Justice is driven by auto QTE", nil) end
-            return false
-        end
-        -- no driver for this one tick: the supervisor puts one back within a
-        -- second, and a token bump no longer kills the farm, so solving here is
-        -- a duplicate at worst instead of a kill
-        solveOnce(entry)
-        return true
+        -- Every earlier version of this guard was about AUTO QTE, and every one
+        -- of them was wrong in a different way: "is a driver thread alive" read
+        -- a dead flag, and "is a rotation in progress" left the auto-cast loop a
+        -- free hand in every pause between rotations, where it pressed the
+        -- tower and bumped the token the farm was watching. The division of
+        -- labour is simpler than any of that: a rotation casts, auto QTE
+        -- solves, auto cast does neither to this tower unless nothing else is
+        -- using it.
+        if Hub.setStatus then Hub.setStatus("Justice is being farmed", nil) end
+        return false
     end
 
     local ok, msg = castEntry(entry)
@@ -2260,137 +2250,78 @@ end
 Hub.setStatus = setStatus
 
 --=============================================================
--- AUTO DRIVER
---   CFG.AutoSolve on  ->  cast the domain and keep solving trials
---   until the gauge fills, then immediately start the next one.
---   flipping the toggle off kills the whole loop.
+-- AUTO QTE  --  A SOLVER, NOT A CASTER
+--   CFG.AutoSolve on  ->  watch for the minigame and solve it. that is all.
+--   Opening the domain belongs to somebody else: auto cast, the FARM button,
+--   or Auto Win. Flipping the toggle off kills the watcher.
+--
+--   This is deliberately not a farm loop any more. Casting from here meant the
+--   toggle quietly did two jobs, and every conflict with auto cast came from
+--   the second one: two loops racing to cast the same domain, one cancelling
+--   the other, and a busy flag that could be left holding the whole solver
+--   shut. A watcher cannot race anybody - it only ever reacts to InQTE.
 --=============================================================
 function Hub.startAuto()
     if Solver.driver then return end
     Solver.stop = false
-    Solver.token = Solver.token + 1
-    -- THE DRIVER'S LIFE IS A GENERATION, NOT THE TOKEN.
-    -- The token means "cancel the rotation that is running right now", and six
-    -- other paths bump it: solveOnce, solveOnly, castAll, the FARM button,
-    -- stopFarm, startAuto itself. The driver used to exit when it saw a token it
-    -- did not recognise, so any one of those - including the auto-cast loop
-    -- pressing the same Justice Sorcerer while the farm sat in its 2..30s pause
-    -- - killed the farm for good. On screen that is "it solves one or two
-    -- minigames and then does nothing", with the toggle still reading on.
-    -- Only startAuto and stopAuto move the generation now.
+    -- THE WATCHER'S LIFE IS A GENERATION, NOT THE TOKEN.
+    -- Six paths bump the token (solveOnce, solveOnly, castAll, the FARM button,
+    -- stopFarm, this function). The old farm driver exited whenever it saw a
+    -- token it did not recognise, so any one of them killed it for good - on
+    -- screen, "it solves one or two minigames and then does nothing". Only
+    -- startAuto and stopAuto move the generation.
     Solver.gen = (Solver.gen or 0) + 1
     local gen = Solver.gen
     Solver.driver = task.spawn(function()
-        local fails = 0
-        local lastFarmPts = points()
-        local saidNoTower = false
-        -- every tower model the driver has ever seen, and when it first saw it.
-        -- a model that is not in here was just built, so its domain waits.
-        local seen = setmetatable({}, { __mode = "k" })
-        local seeded = false
+        local solved = 0
         while CFG.AutoSolve and getgenv().STD_Hub == Hub and Solver.gen == gen do
-            -- a tower you just built must not pop its domain on the same breath.
-            -- Place.spawn stamps freshUntil on every successful placement, and
-            -- the seen-table below covers towers placed by the game itself.
-            local P = Hub.Place
-            if P and P.autoCastHeld and P.autoCastHeld() then
-                task.wait(0.4)
-                continue
-            end
-            local towers = scanTowers()
-            local now = os.clock()
-            local grace = CFG.CastGrace or 8
-            if not seeded then
-                -- whatever is already on the map when the farm starts is old
-                for _, e in ipairs(towers) do seen[e.model] = now - grace end
-                seeded = true
-            end
-            local justice
-            for _, e in ipairs(towers) do
-                if e.spec.qte and not e.blocked then
-                    if not seen[e.model] then seen[e.model] = now end
-                    if now - seen[e.model] >= grace then justice = e break end
+            -- 0.3s: fast enough that the marker has barely moved by the time the
+            -- solve starts, cheap enough to sit here for hours
+            task.wait(0.3)
+            local q = qteFolder()
+            if q and q.InQTE and q.InQTE.Value then
+                -- a FARM rotation or a manual solve already owns this minigame.
+                -- playTrial has its own lock, but it answers a second caller by
+                -- refusing out loud, and a refused caller is noise in the log
+                if not Solver.busy and not Solver.running then
+                    -- a stop left behind by the FARM button is not about this
+                    -- watcher. playTrial breaks on Solver.stop, so without this
+                    -- one press of FARM would leave stop=true and every later
+                    -- minigame would be ignored in silence - with the toggle
+                    -- still reading on
+                    Solver.stop = false
+                    Solver.active = true
+                    local h, m, c = playTrial()
+                    Solver.active = false
+                    if c and c > 0 then
+                        solved = solved + 1
+                        log(("auto qte: minigame %d - clicks=%d hits=%d misses=%d -> %.2f/%.0f")
+                            :format(solved, c, h, m, points(), CFG.TargetPts))
+                        if Hub.setStatus then
+                            Hub.setStatus(("qte h%d m%d   %.1f/%.0f"):format(
+                                h, m, points(), CFG.TargetPts), "good")
+                        end
+                    end
                 end
             end
-            if justice then
-                saidNoTower = false
-                Solver.busy = true
-                Solver.active = true
-                -- this is the ONLY window in which the auto-cast loop must keep
-                -- its hands off the QTE ability, and pressEntry reads it. it has
-                -- to be a separate flag from busy/active, because those are also
-                -- held by solveOnce and by the driver while it is idle
-                Solver.farming = true
-                -- A FRESH TOKEN PER ROTATION. the rotation is what a token bump
-                -- is allowed to cancel. taking the token once at the top of the
-                -- driver meant the second rotation started with a token that
-                -- was already stale and returned on its first check - forever.
-                -- runQTERotation gets the token that is current RIGHT NOW, so a
-                -- cancel costs one rotation and the next one just runs
-                local rot = Solver.token
-                local ran = false
-                local ok = pcall(function() ran = runQTERotation(justice, rot, 2147483647) end)
-                Solver.farming = false
-                Solver.busy = false
-                Solver.active = false
-                -- THE RETRY LOOP USED TO BE A MACHINE GUN. runQTERotation
-                -- returns false when the server refused the domain, and that
-                -- return was thrown away - so `pcall` succeeded, fails reset to
-                -- zero, and the whole farm restarted two seconds later. a
-                -- refused domain produced `DOMAIN fired (silent)` +
-                -- `no QTE: server refused` every 1.5s, twenty times in a row,
-                -- which is what the log looked like. the gauge moving is the
-                -- only real proof of progress, so that is what resets the
-                -- counter; anything else backs off
-                if points() > lastFarmPts then
-                    fails = 0
-                    lastFarmPts = points()
-                elseif ok and ran == true then
-                    fails = 0
-                else
-                    fails = fails + 1
-                end
-                if fails == 3 then
-                    log("QTE farm: the domain keeps being refused - backing off to 30s between attempts")
-                    if Hub.setStatus then Hub.setStatus("domain refused - backing off", "warn") end
-                end
-            end
-            -- a farm with no tower in the map used to sit there in silence. it is
-            -- not an error - the tower is placed by the player - but a farm that
-            -- looks dead is worse than one that says why
-            if not justice and not saidNoTower then
-                saidNoTower = true
-                log("QTE farm: no Justice Sorcerer on the map - waiting for one to be placed")
-                if Hub.setStatus then Hub.setStatus("QTE farm: place a Justice Sorcerer", "warn") end
-            end
-            if Solver.gen ~= gen then break end
-            -- 2s normally, then 4, 8, 16, 30. a refusal is usually "no wave
-            -- running" or a dead tower, and neither is fixed by asking again
-            -- sooner - it just fills the log
-            local pause = 2
-            if fails > 1 then pause = math.min(30, 2 ^ math.min(fails, 5)) end
-            task.wait(pause)
         end
-        Solver.busy = false
         Solver.active = false
-        Solver.farming = false
         Solver.driver = nil
         flushLog()
     end)
-    -- a thread that finished before the assignment above - which happens when
-    -- CFG.AutoSolve is already false on entry - would otherwise leave a dead
-    -- handle in Solver.driver and block every later start
+    -- a thread that finished before the assignment above would otherwise leave
+    -- a dead handle in Solver.driver and block every later start
     if Solver.driver and coroutine.status(Solver.driver) == "dead" then
         Solver.driver = nil
     end
     Hub.startSupervisor()
 end
 
--- A DRIVER THAT DIES MUST NOT LEAVE THE TOGGLE LYING.
--- Everything above is supposed to keep the farm alive, and this is the backstop
--- for the case where something still kills it: an error outside the pcall, a
--- cancelled rotation, a path that bumps the generation by accident. While
--- CFG.AutoSolve is true, a missing driver is put back within a second. "on"
+-- A WATCHER THAT DIES MUST NOT LEAVE THE TOGGLE LYING.
+-- Everything above is supposed to keep it running, and this is the backstop for
+-- the case where something still kills it: an error outside the pcall, a
+-- cancelled thread, a path that bumps the generation by accident. While
+-- CFG.AutoSolve is true, a missing watcher is put back within a second. "on"
 -- now means on, which is what the toggle has always claimed.
 function Hub.startSupervisor()
     if Solver.supervisor then return end
@@ -2400,11 +2331,11 @@ function Hub.startSupervisor()
             task.wait(1)
             if CFG.AutoSolve and not Solver.driver then
                 restarts = restarts + 1
-                -- a farm that cannot start logs its own reason; this line only
-                -- has to say that the restart happened, and not sixty times a
-                -- minute when the reason is permanent
+                -- a watcher that cannot start has its own reason in the log;
+                -- this line only has to say the restart happened, and not sixty
+                -- times a minute when the reason is permanent
                 if restarts <= 3 or restarts % 60 == 0 then
-                    log(("QTE farm: the driver was not running - restarting it (%d)"):format(restarts))
+                    log(("auto qte: the watcher was not running - restarting it (%d)"):format(restarts))
                 end
                 Hub.startAuto()
             end
@@ -3309,7 +3240,7 @@ abilBox:AddDivider()
 abilBox:AddToggle("AutoQTE", {
     Text = "Auto QTE",
     Default = CFG.AutoSolve,
-    Tooltip = "solve the Justice Sorcerer timing minigame",
+    Tooltip = "solve the timing minigame whenever it is on screen. it does not cast the domain - auto cast, the FARM button and Auto Win do that",
     Callback = function(v)
         CFG.AutoSolve = v
         if not v then
@@ -3318,7 +3249,7 @@ abilBox:AddToggle("AutoQTE", {
         else
             getgenv().STD_Edge = nil
             Hub.startAuto()
-            setStatus("auto qte on - farming until you turn it off", "good")
+            setStatus("auto qte on - solving minigames", "good")
         end
     end,
 })
