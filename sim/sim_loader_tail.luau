@@ -38,7 +38,7 @@ elseif SCENARIO == 3 then
     ok(#LOADED == 1, "with no network the cache is loaded")
     ok(LOADED[1] == HUB_BODY, "the cached bytes are the bytes that run")
     ok(hitsMatching("raw.githubusercontent.com") == 1, "raw was attempted before giving up")
-    ok(hitsMatching("raw.githack.com") == 1, "the last mirror was attempted too")
+    ok(hitsMatching("fastly.jsdelivr.net") == 1, "the last mirror was attempted too")
 
 elseif SCENARIO == 4 then
     ok(#LOADED == 0, "no network and no cache loads nothing")

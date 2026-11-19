@@ -59,7 +59,7 @@ elseif SCENARIO == 5 then
     -- a captive portal: 200, HTML, no STD anywhere
     serve("raw.githubusercontent.com", "<html><body>login to wifi</body></html>")
     serve("cdn.jsdelivr.net", "<html><body>login to wifi</body></html>")
-    serve("raw.githack.com", "<html><body>login to wifi</body></html>")
+    serve("fastly.jsdelivr.net", "<html><body>login to wifi</body></html>")
 end
 
 local HITS = {}

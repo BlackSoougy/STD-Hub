@@ -33,11 +33,11 @@ The loader does three things the hub cannot do for itself:
 ## The fetch chain
 
 ```
-raw.githubusercontent  ->  jsDelivr  ->  raw.githack  ->  STD_Hub_cache.luau  ->  hand-copied file
+raw.githubusercontent  ->  cdn.jsdelivr  ->  fastly.jsdelivr  ->  STD_Hub_cache.luau  ->  hand-copied file
 ```
 
 `raw.githubusercontent` is canonical but rate-limits a machine doing six
-simultaneous joins, which is exactly what a multi-box is. The two mirrors serve
+simultaneous joins, which is exactly what a multi-box is. The two jsDelivr edges serve
 the same bytes off different CDNs. Every successful fetch is written to
 `STD_Hub_cache.luau`, so a join with no internet still runs the last good build
 instead of nothing.

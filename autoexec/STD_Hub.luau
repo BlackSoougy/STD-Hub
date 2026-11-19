@@ -18,8 +18,9 @@
   THE ORDER
   ---------
     1. raw.githubusercontent  canonical, but rate-limits a burst of joins
-    2. jsDelivr CDN           same bytes, different CDN, different rate limit
-    3. raw.githack            last CDN fallback
+    2. cdn.jsdelivr.net       same bytes, different CDN, different rate limit
+    3. fastly.jsdelivr.net    second jsDelivr edge - survives a DNS blackhole on
+                              either of the other two hostnames
 
   If all three fail the loader is not loaded and a line is appended to
   STD_Autoexec_log.txt. The hub's own cache is a separate layer: once the loader
@@ -35,7 +36,7 @@ local BUILD = "2026-11-19"
 local URLS = {
     ("https://raw.githubusercontent.com/%s/%s/STD_Loader.luau?v=%s"):format(REPO, REF, BUILD),
     ("https://cdn.jsdelivr.net/gh/%s@%s/STD_Loader.luau"):format(REPO, REF),
-    ("https://raw.githack.com/%s/%s/STD_Loader.luau"):format(REPO, REF),
+    ("https://fastly.jsdelivr.net/gh/%s@%s/STD_Loader.luau"):format(REPO, REF),
 }
 
 -- its own file. the loader rewrites STD_Loader_log.txt from the top on every

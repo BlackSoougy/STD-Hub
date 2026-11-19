@@ -186,8 +186,10 @@ end
 --
 --   * THREE SOURCES, IN ORDER. raw.githubusercontent is canonical but it is also
 --     the one that rate-limits a machine doing six simultaneous joins. jsDelivr
---     and githack serve the same bytes off different CDNs, so a 429 on the first
---     costs a few hundred milliseconds instead of a dead client.
+--     serves the same bytes off a different CDN, so a 429 on the first costs a
+--     few hundred milliseconds instead of a dead client. The third entry is a
+--     second jsDelivr edge: same bytes, different hostname, which is what saves
+--     a client whose DNS has one of the two names blackholed.
 --   * A DISK COPY IS WRITTEN ON EVERY SUCCESSFUL FETCH. If all three are
 --     unreachable - no internet, DNS dead, GitHub down - the last good build is
 --     loaded from STD_Hub_cache.luau. A stale hub beats an empty one, and the
@@ -209,7 +211,7 @@ local CACHE_FILE = "STD_Hub_cache.luau"
 local HUB_URLS = {
     ("https://raw.githubusercontent.com/%s/%s/STD_Hub.luau?v=%s"):format(REPO, REF, BUILD),
     ("https://cdn.jsdelivr.net/gh/%s@%s/STD_Hub.luau"):format(REPO, REF),
-    ("https://raw.githack.com/%s/%s/STD_Hub.luau"):format(REPO, REF),
+    ("https://fastly.jsdelivr.net/gh/%s@%s/STD_Hub.luau"):format(REPO, REF),
 }
 
 local function looksLikeHub(body)
