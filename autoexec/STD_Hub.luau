@@ -31,7 +31,7 @@
 
 local REPO  = "BlackSoougy/STD-Hub"
 local REF   = "main"
-local BUILD = "2026-11-19"
+local BUILD = "2026-11-20"
 
 local URLS = {
     ("https://raw.githubusercontent.com/%s/%s/STD_Loader.luau?v=%s"):format(REPO, REF, BUILD),

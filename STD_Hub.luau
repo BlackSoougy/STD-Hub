@@ -1076,7 +1076,13 @@ end
 -- millisecond. a live loop stamps beat every frame, so staleness is a fact
 -- instead of an opinion
 local Solver = { busy = false, stop = false, token = 0, active = false,
-                 running = false, runToken = nil, beat = 0, farming = false }
+                 running = false, runToken = nil, beat = 0, farming = false,
+                 -- gen is the FARM DRIVER's lifetime and nothing else touches
+                 -- it. token cancels one rotation and is bumped by six other
+                 -- paths; using it for both meant every one of them killed the
+                 -- farm. busyRun names whoever set busy, so a thread that was
+                 -- overtaken can no longer leave the flag stuck on
+                 gen = 0, busyRun = 0, supervisor = nil }
 
 local SOLVER_STALE = 1.0   -- seconds without a heartbeat before a lock is dead
 
@@ -1933,6 +1939,8 @@ local function solveOnce(entry)
     Solver.active = true
     Solver.token = Solver.token + 1
     local token = Solver.token
+    local runId = token
+    Solver.busyRun = runId
     -- if the server never acknowledged the cast there is no point sitting in a
     -- 26s wait, the domain simply is not coming
     local waitFor = entry.lastAccepted == false and 4 or CFG.WaitForQTE
@@ -1963,7 +1971,13 @@ local function solveOnce(entry)
                     h, m, points(), CFG.TargetPts), "good")
             end
         end)
-        if Solver.token == token then
+        -- whoever set busy owns it. the old check was "does the token still
+        -- match", which meant any bump from anywhere - the farm driver, the
+        -- FARM button, a second castAll - left busy=true for the rest of the
+        -- session. every later attempt then read "the solver is already
+        -- running" and returned, which is the exact shape of "solves one
+        -- minigame and then never again"
+        if Solver.busyRun == runId then
             Solver.busy = false
             Solver.active = false
         end
@@ -1984,6 +1998,8 @@ local function solveOnly()
     Solver.active = true
     Solver.token = Solver.token + 1
     local token = Solver.token
+    local runId = token
+    Solver.busyRun = runId
     table.insert(Hub.threads, task.spawn(function()
         pcall(function()
             if not waitQTE(CFG.WaitForQTE) then
@@ -1999,7 +2015,7 @@ local function solveOnly()
                     h, m, points(), CFG.TargetPts), "good")
             end
         end)
-        if Solver.token == token then
+        if Solver.busyRun == runId then
             Solver.busy = false
             Solver.active = false
         end
@@ -2105,10 +2121,15 @@ local function farmQTE()
     Solver.token = Solver.token + 1
     Solver.busy = true
     Solver.active = true
+    -- a manual FARM rotation owns the QTE ability exactly like the auto driver
+    -- does, so pressEntry has to keep its hands off it here too. it also gives
+    -- ensureFarm below something to test that is not the busy flag
+    Solver.farming = true
     local token = Solver.token
 
     local thread = task.spawn(function()
         pcall(function() runQTERotation(justice, token, CFG.MaxTrials) end)
+        Solver.farming = false
         Solver.busy = false
         Solver.active = false
         if farmBtn then farmBtn.Text = "FARM QTE" end
@@ -2116,6 +2137,27 @@ local function farmQTE()
     end)
     table.insert(Hub.threads, thread)
     if farmBtn then farmBtn.Text = "FARM QTE: RUNNING - click to stop" end
+end
+
+-- "MAKE SURE A FARM IS RUNNING", NOT "TOGGLE A FARM".
+-- farmQTE reads a second call while busy as "stop" - that is what makes the
+-- FARM button a toggle. The anniversary driver calls this every couple of
+-- seconds to keep the gauge filling, and under toggle semantics it stopped the
+-- farm it had started on the very next tick, then started it again, and the
+-- minigame solved once or twice and appeared to die. This leaves a live
+-- rotation alone and only clears a busy flag that has nothing behind it.
+function Hub.ensureFarm()
+    if Solver.busy then
+        if Solver.farming or Solver.running then return false end
+        -- a cast that is still waiting for its minigame has not failed, and
+        -- stealing its flag here is how two loops end up on one bar
+        if Solver.waitUntil and os.clock() < Solver.waitUntil then return false end
+        log("QTE farm: busy flag with no live rotation behind it - clearing")
+        Solver.busy = false
+        Solver.active = false
+    end
+    farmQTE()
+    return true
 end
 
 --=============================================================
@@ -2212,7 +2254,17 @@ function Hub.startAuto()
     if Solver.driver then return end
     Solver.stop = false
     Solver.token = Solver.token + 1
-    local token = Solver.token
+    -- THE DRIVER'S LIFE IS A GENERATION, NOT THE TOKEN.
+    -- The token means "cancel the rotation that is running right now", and six
+    -- other paths bump it: solveOnce, solveOnly, castAll, the FARM button,
+    -- stopFarm, startAuto itself. The driver used to exit when it saw a token it
+    -- did not recognise, so any one of those - including the auto-cast loop
+    -- pressing the same Justice Sorcerer while the farm sat in its 2..30s pause
+    -- - killed the farm for good. On screen that is "it solves one or two
+    -- minigames and then does nothing", with the toggle still reading on.
+    -- Only startAuto and stopAuto move the generation now.
+    Solver.gen = (Solver.gen or 0) + 1
+    local gen = Solver.gen
     Solver.driver = task.spawn(function()
         local fails = 0
         local lastFarmPts = points()
@@ -2221,7 +2273,7 @@ function Hub.startAuto()
         -- a model that is not in here was just built, so its domain waits.
         local seen = setmetatable({}, { __mode = "k" })
         local seeded = false
-        while CFG.AutoSolve and getgenv().STD_Hub == Hub and Solver.token == token do
+        while CFG.AutoSolve and getgenv().STD_Hub == Hub and Solver.gen == gen do
             -- a tower you just built must not pop its domain on the same breath.
             -- Place.spawn stamps freshUntil on every successful placement, and
             -- the seen-table below covers towers placed by the game itself.
@@ -2254,10 +2306,15 @@ function Hub.startAuto()
                 -- to be a separate flag from busy/active, because those are also
                 -- held by solveOnce and by the driver while it is idle
                 Solver.farming = true
-                -- finite cap on purpose: runQTERotation formats it with %d and
-                -- math.huge has no integer representation in Luau
+                -- A FRESH TOKEN PER ROTATION. the rotation is what a token bump
+                -- is allowed to cancel. taking the token once at the top of the
+                -- driver meant the second rotation started with a token that
+                -- was already stale and returned on its first check - forever.
+                -- runQTERotation gets the token that is current RIGHT NOW, so a
+                -- cancel costs one rotation and the next one just runs
+                local rot = Solver.token
                 local ran = false
-                local ok = pcall(function() ran = runQTERotation(justice, token, 2147483647) end)
+                local ok = pcall(function() ran = runQTERotation(justice, rot, 2147483647) end)
                 Solver.farming = false
                 Solver.busy = false
                 Solver.active = false
@@ -2291,7 +2348,7 @@ function Hub.startAuto()
                 log("QTE farm: no Justice Sorcerer on the map - waiting for one to be placed")
                 if Hub.setStatus then Hub.setStatus("QTE farm: place a Justice Sorcerer", "warn") end
             end
-            if Solver.token ~= token then break end
+            if Solver.gen ~= gen then break end
             -- 2s normally, then 4, 8, 16, 30. a refusal is usually "no wave
             -- running" or a dead tower, and neither is fixed by asking again
             -- sooner - it just fills the log
@@ -2301,14 +2358,52 @@ function Hub.startAuto()
         end
         Solver.busy = false
         Solver.active = false
+        Solver.farming = false
         Solver.driver = nil
         flushLog()
+    end)
+    -- a thread that finished before the assignment above - which happens when
+    -- CFG.AutoSolve is already false on entry - would otherwise leave a dead
+    -- handle in Solver.driver and block every later start
+    if Solver.driver and coroutine.status(Solver.driver) == "dead" then
+        Solver.driver = nil
+    end
+    Hub.startSupervisor()
+end
+
+-- A DRIVER THAT DIES MUST NOT LEAVE THE TOGGLE LYING.
+-- Everything above is supposed to keep the farm alive, and this is the backstop
+-- for the case where something still kills it: an error outside the pcall, a
+-- cancelled rotation, a path that bumps the generation by accident. While
+-- CFG.AutoSolve is true, a missing driver is put back within a second. "on"
+-- now means on, which is what the toggle has always claimed.
+function Hub.startSupervisor()
+    if Solver.supervisor then return end
+    Solver.supervisor = task.spawn(function()
+        local restarts = 0
+        while getgenv().STD_Hub == Hub do
+            task.wait(1)
+            if CFG.AutoSolve and not Solver.driver then
+                restarts = restarts + 1
+                -- a farm that cannot start logs its own reason; this line only
+                -- has to say that the restart happened, and not sixty times a
+                -- minute when the reason is permanent
+                if restarts <= 3 or restarts % 60 == 0 then
+                    log(("QTE farm: the driver was not running - restarting it (%d)"):format(restarts))
+                end
+                Hub.startAuto()
+            end
+        end
+        Solver.supervisor = nil
     end)
 end
 
 function Hub.stopAuto()
     Solver.stop = true
     Solver.token = Solver.token + 1
+    -- the generation is what the driver actually watches, and it has to move
+    -- before the cancel so a driver that is mid-pcall cannot loop once more
+    Solver.gen = (Solver.gen or 0) + 1
     if Solver.driver then pcall(function() task.cancel(Solver.driver) end) end
     Solver.driver = nil
     Solver.busy = false
@@ -9048,15 +9143,17 @@ function AutoWin.step()
     -- only ever the restart. the pause keeps a domain that refuses to cast from
     -- being hammered every two seconds
     if os.clock() < (AutoWin.nextTry or 0) then return end
-    if Hub.solver and not Hub.solver.busy then
-        if Hub.points() < CFG.TargetPts then
-            AutoWin.status = ("farming %.1f/%.0f"):format(Hub.points(), CFG.TargetPts)
-            AutoWin.nextTry = os.clock() + 6
-            Hub.farmQTE()
-        else
-            AutoWin.status = "gauge full - waiting for the execution"
-            AutoWin.nextTry = os.clock() + 4
-        end
+    if Hub.points() < CFG.TargetPts then
+        -- ensureFarm, not farmQTE. farmQTE is the FARM button's toggle: calling
+        -- it while a rotation is running STOPS that rotation. A 2s poller
+        -- calling a toggle is why the anniversary farm solved one or two
+        -- minigames and then sat there - it kept cancelling its own work
+        AutoWin.status = ("farming %.1f/%.0f"):format(Hub.points(), CFG.TargetPts)
+        AutoWin.nextTry = os.clock() + 6
+        if Hub.ensureFarm then Hub.ensureFarm() end
+    else
+        AutoWin.status = "gauge full - waiting for the execution"
+        AutoWin.nextTry = os.clock() + 4
     end
 end
 
@@ -9074,7 +9171,11 @@ end
 function AutoWin.stop()
     AutoWin.on = false
     AutoWin._thread = nil
-    if Hub.solver then Hub.solver.stop = true end
+    -- only stop the solver when nothing else owns it. AUTO QTE is a separate
+    -- toggle and turning the anniversary farm off must not kill the farm the
+    -- user asked for with the other switch - stop=true has no owner, so the
+    -- driver would keep starting rotations that abort on their first check
+    if Hub.solver and not CFG.AutoSolve then Hub.solver.stop = true end
 end
 
 --=============================================================
