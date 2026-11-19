@@ -218,11 +218,17 @@ local HUB_URLS = {
     ("https://fastly.jsdelivr.net/gh/%s@%s/STD_Hub.luau"):format(REPO, REF),
 }
 
+-- the marker is "hub v", not "STD". There is a 56KB ancestor of this hub sitting
+-- in the executor workspace from an earlier build; it says "STD Hub" in its
+-- header and passes every other check here, so a body that only had to contain
+-- "STD" would let the loader run a month-old hub and call it a successful load.
+-- "hub v" is in every build from v7 on and in none of the ancestors, and unlike
+-- "hub v7" it does not need editing when the version rolls.
 local function looksLikeHub(body)
     if type(body) ~= "string" or #body < 20000 then return false end
     if body:sub(1, 1) == "<" then return false end                 -- html
     if body:sub(1, 1) == "{" or body:sub(1, 1) == "[" then return false end
-    return body:find("STD", 1, true) ~= nil
+    return body:find("hub v", 1, true) ~= nil
 end
 
 -- ONE ARGUMENT, DELIBERATELY.

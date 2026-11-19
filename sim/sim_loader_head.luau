@@ -34,7 +34,11 @@ getgenv = function() return _G end
 
 --=========================================================================
 -- a body that passes looksLikeHub but is not 437KB
-local HUB_BODY = string.rep("-- STD Hub build\n", 2000)   -- ~34KB
+local HUB_BODY = string.rep("-- STD Hub build, hub v7 loaded\n", 2000)   -- ~66KB
+-- the 56KB ancestor that still sits in the executor workspace: says "STD Hub",
+-- carries no version marker, and must never be mistaken for the hub
+local ANCESTOR = "--[[\n    STD Hub  |  Sorcerer Tower Defense  |  UNIVERSAL\n]]\n"
+    .. string.rep("-- filler line\n", 3000)
 local GOOD = "STD"
 
 local SCENARIO = __SCENARIO__
@@ -60,6 +64,11 @@ elseif SCENARIO == 5 then
     serve("raw.githubusercontent.com", "<html><body>login to wifi</body></html>")
     serve("cdn.jsdelivr.net", "<html><body>login to wifi</body></html>")
     serve("fastly.jsdelivr.net", "<html><body>login to wifi</body></html>")
+elseif SCENARIO == 6 then
+    -- every source serves the old 56KB ancestor: right shape, no version marker
+    serve("raw.githubusercontent.com", ANCESTOR)
+    serve("cdn.jsdelivr.net", ANCESTOR)
+    serve("fastly.jsdelivr.net", ANCESTOR)
 end
 
 local HITS = {}

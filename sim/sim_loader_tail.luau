@@ -47,6 +47,12 @@ elseif SCENARIO == 4 then
 elseif SCENARIO == 5 then
     ok(#LOADED == 0, "an HTML captive portal never reaches loadstring")
     ok(FS["STD_Hub_cache.luau"] == nil, "a rejected body is not cached")
+
+elseif SCENARIO == 6 then
+    ok(#LOADED == 0, "the 56KB ancestor is rejected - it has no version marker")
+    ok(FS["STD_Hub_cache.luau"] == nil, "the ancestor is not cached either")
+    ok(hitsMatching("raw.githubusercontent.com") == 2,
+       "all three sources were tried, twice each through the retry")
 end
 
 print(("  %d passed, %d failed"):format(PASS, FAIL))

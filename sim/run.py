@@ -27,6 +27,7 @@ SCENARIOS = {
     3: "every source dead, cache on disk",
     4: "every source dead, nothing on disk",
     5: "captive portal HTML",
+    6: "every source serves the old 56KB ancestor",
 }
 
 

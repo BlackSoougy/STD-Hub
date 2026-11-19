@@ -43,9 +43,15 @@ the same bytes off different CDNs. Every successful fetch is written to
 instead of nothing.
 
 A body is checked before it reaches `loadstring`: at least 20 KB, not HTML, not
-JSON, and it must contain `STD`. A 429 response is 90 bytes of JSON and a captive
+JSON, and it must contain `hub v`. A 429 response is 90 bytes of JSON and a captive
 portal is an HTML page; both would otherwise fail inside the hub with a syntax
 error naming the wrong cause.
+
+The `hub v` marker is what separates the current build from the 56 KB ancestor of
+this hub that still sits in the executor workspace. That ancestor says "STD Hub"
+in its header and would pass a looser check, so the loader would happily run a
+month-old hub and report a successful load. Every build from v7 on carries
+`hub v`; none of the ancestors do.
 
 ## Updating
 

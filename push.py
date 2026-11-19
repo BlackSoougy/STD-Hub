@@ -103,6 +103,63 @@ def stamp(owner, repo):
             print(f"stamped {os.path.relpath(path, HERE)}")
 
 
+def windows_vault_token(target="git:https://github.com"):
+    """
+    Read the GitHub credential straight out of the Windows Credential Manager.
+
+    `git credential fill` would also work, but it shells out to
+    git-credential-manager.exe, and that helper tries to draw a window. In a
+    non-interactive shell the window cannot be created and Windows throws
+    "the binding handle is invalid" in a modal dialog on the desktop. Reading the
+    vault through advapi32 directly skips the helper entirely: same secret, no
+    window, nothing to click.
+
+    Returns None if there is no entry, so the caller can fall through to an
+    explicit --token.
+    """
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class CREDENTIAL(ctypes.Structure):
+        _fields_ = [
+            ("Flags", wintypes.DWORD),
+            ("Type", wintypes.DWORD),
+            ("TargetName", wintypes.LPWSTR),
+            ("Comment", wintypes.LPWSTR),
+            ("LastWritten", wintypes.FILETIME),
+            ("CredentialBlobSize", wintypes.DWORD),
+            ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)),
+            ("Persist", wintypes.DWORD),
+            ("AttributeCount", wintypes.DWORD),
+            ("Attributes", ctypes.c_void_p),
+            ("TargetAlias", wintypes.LPWSTR),
+            ("UserName", wintypes.LPWSTR),
+        ]
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi.CredReadW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        ctypes.POINTER(ctypes.POINTER(CREDENTIAL)),
+    ]
+    advapi.CredReadW.restype = wintypes.BOOL
+    advapi.CredFree.argtypes = [ctypes.c_void_p]
+
+    ptr = ctypes.POINTER(CREDENTIAL)()
+    if not advapi.CredReadW(target, 1, 0, ctypes.byref(ptr)):   # 1 = CRED_TYPE_GENERIC
+        return None
+    try:
+        cred = ptr.contents
+        raw = ctypes.string_at(cred.CredentialBlob, cred.CredentialBlobSize)
+        try:
+            return raw.decode("utf-16-le").rstrip("\x00")
+        except UnicodeDecodeError:
+            return raw.decode("utf-8", "ignore").rstrip("\x00")
+    finally:
+        advapi.CredFree(ptr)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"),
@@ -114,8 +171,11 @@ def main():
     ap.add_argument("--private", action="store_true",
                     help="private repos cannot be fetched by raw URL without auth")
     args = ap.parse_args()
-    if not args.token:
-        die("no token: pass --token or set GITHUB_TOKEN")
+    token = args.token or os.environ.get("GITHUB_TOKEN") or windows_vault_token()
+    if not token:
+        die("no token: pass --token, set GITHUB_TOKEN, or store a "
+            "git:https://github.com credential in the Windows vault")
+    args.token = token
 
     hub = os.path.join(HERE, "STD_Hub.luau")
     if not os.path.isfile(hub):
