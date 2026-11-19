@@ -201,13 +201,17 @@ end
 -- REPO is the only line that needs editing if the repo ever moves.
 local REPO  = "BlackSoougy/STD-Hub"
 local REF   = "main"
-local BUILD = "2026-11-19"      -- bumped on every push; raw caches for ~5 min
+local BUILD = "2026-11-19"
 
 local CACHE_FILE = "STD_Hub_cache.luau"
 
--- the ?v= is a cache-buster. without it raw.githubusercontent keeps serving the
--- previous build for up to five minutes after a push, which looks exactly like a
--- push that never landed
+-- the ?v= separates the EXECUTOR's own http cache, which keys on the full URL.
+-- It does not touch raw.githubusercontent's CDN: that cache keys on the path
+-- alone, ignores the query string, and holds the previous build for up to five
+-- minutes after a push. Measured, not assumed - the response carries
+-- "Cache-Control: max-age=300" and a HIT, and a request with a fresh query
+-- string still returns the old bytes. So expect exactly one stale join after an
+-- update, and reload twice if the first one comes up as the old build.
 local HUB_URLS = {
     ("https://raw.githubusercontent.com/%s/%s/STD_Hub.luau?v=%s"):format(REPO, REF, BUILD),
     ("https://cdn.jsdelivr.net/gh/%s@%s/STD_Hub.luau"):format(REPO, REF),

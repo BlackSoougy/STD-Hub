@@ -55,7 +55,8 @@ end
 -- one argument on purpose. a second "nocache" flag is accepted by some
 -- executors and raises an argument error on the rest, and probing for it means
 -- asking a rate-limited source twice - which is the one request that must not be
--- repeated. the ?v= on the first URL does the same job.
+-- repeated. the ?v= only separates the executor's own cache; raw's CDN ignores
+-- the query string entirely and holds the old build for five minutes.
 local function httpGet(url)
     return pcall(game.HttpGet, game, url)
 end

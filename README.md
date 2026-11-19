@@ -52,10 +52,11 @@ error naming the wrong cause.
 Push a new `STD_Hub.luau`. Nothing on the client changes - the loader fetches it
 on the next join.
 
-`local BUILD` in both `STD_Loader.luau` and `autoexec/STD_Hub.luau` is a
-cache-buster (`?v=`). Bump it on every push: without it, raw.githubusercontent
-keeps serving the previous build from its CDN for up to five minutes, which looks
-exactly like a push that never landed. `push.py` stamps it automatically.
+`local BUILD` in both `STD_Loader.luau` and `autoexec/STD_Hub.luau` is stamped
+with the push date by `push.py`. It separates the executor's own http cache, but
+it does **not** bust raw.githubusercontent: that CDN keys on the path, ignores
+the query string, and serves the previous build for up to five minutes
+(`Cache-Control: max-age=300`). Expect one stale join after an update.
 
 ## Rebuilding from source
 

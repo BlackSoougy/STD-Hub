@@ -89,8 +89,10 @@ def stamp(owner, repo):
         with open(path, "r", encoding="utf-8") as f:
             src = f.read()
         out = src.replace("OWNER/STD-Hub", f"{owner}/{repo}")
-        # the build stamp is the cache-buster; a stale one serves the old build
-        # from raw.githubusercontent's CDN for five minutes after every push
+        # the build stamp is the push date. it separates the executor's own http
+        # cache only - raw.githubusercontent's CDN keys on the path and ignores
+        # the query string, so it still serves the old build for five minutes
+        # after a push (max-age=300, measured)
         for line in src.splitlines():
             if line.startswith("local BUILD = "):
                 old = line.split('"')[1]
