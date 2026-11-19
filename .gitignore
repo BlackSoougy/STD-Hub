@@ -1,0 +1,3 @@
+sim/_run_*.luau
+__pycache__/
+*.pyc
