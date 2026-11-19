@@ -60,9 +60,11 @@ def api(path, token, method="GET", payload=None):
         return e.code, body
 
 
-def http_get(url, token=None):
+def http_get(url, token=None, accept=None):
     req = urllib.request.Request(url)
     req.add_header("User-Agent", "std-hub-publisher")
+    if accept:
+        req.add_header("Accept", accept)
     if token:
         req.add_header("Authorization", "Bearer " + token)
     try:
@@ -239,17 +241,40 @@ def main():
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     raw = f"https://raw.githubusercontent.com/{owner}/{args.repo}/{args.branch}/STD_Hub.luau"
-    print("verifying the raw URL...")
+    local_md5 = hashlib.md5(open(hub, "rb").read()).hexdigest()
+
+    # THE AUTHORITATIVE CHECK IS THE GIT OBJECT, NOT THE RAW URL.
+    # raw.githubusercontent is behind a CDN that keys on the path and holds a
+    # build for 300 seconds; verifying against it right after a push fails on a
+    # push that worked perfectly, which is a worse outcome than not checking.
+    # The contents API reads the blob out of the repo itself.
+    print("verifying the repo object...")
+    status, data = http_get(
+        f"{API}/repos/{owner}/{args.repo}/contents/STD_Hub.luau?ref={args.branch}",
+        token=args.token,
+        accept="application/vnd.github.raw",
+    )
+    if status != 200:
+        die(f"the contents API answered {status} - the push did not land")
+    object_md5 = hashlib.md5(data).hexdigest()
+    print(f"  local  {local_md5}  {len(open(hub,'rb').read())/1024:.0f} KB")
+    print(f"  repo   {object_md5}  {len(data)/1024:.0f} KB")
+    if local_md5 != object_md5:
+        die("the blob in the repo is not the file on disk - a push raced a write")
+
+    # and then what a client actually gets, reported rather than enforced
+    print("checking the raw URL...")
     status, data = http_get(raw)
     if status != 200:
         die(f"the raw URL answered {status} - the repo is probably private, "
             f"and raw.githubusercontent does not serve private files to a loadstring")
-    local_md5 = hashlib.md5(open(hub, "rb").read()).hexdigest()
     remote_md5 = hashlib.md5(data).hexdigest()
-    print(f"  local  {local_md5}  {len(open(hub,'rb').read())/1024:.0f} KB")
-    print(f"  remote {remote_md5}  {len(data)/1024:.0f} KB")
-    if local_md5 != remote_md5:
-        die("the bytes on GitHub are not the bytes on disk - a push raced a write")
+    if remote_md5 == local_md5:
+        print("  raw    same build, a client joining now gets this one")
+    else:
+        print(f"  raw    still serving the previous build ({len(data)/1024:.0f} KB).")
+        print("         that is the CDN's 300s cache, not a failed push - it clears")
+        print("         on its own, and a join in the next five minutes may be stale")
 
     loader = f"https://raw.githubusercontent.com/{owner}/{args.repo}/{args.branch}/STD_Loader.luau"
     print()
