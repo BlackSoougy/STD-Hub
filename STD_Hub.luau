@@ -2034,20 +2034,35 @@ local function pressEntry(entry)
     end
 
     if entry.spec.qte and CFG.AutoSolve then
-        -- ONLY WHILE THE FARM IS ACTUALLY ROTATING DOMAINS.
-        -- the farm driver casts this ability itself, so letting the auto-cast
-        -- loop press the same button produced `DOMAIN fired (silent)` +
-        -- `no QTE: server refused` every 1.2s, thirty times in a row: two
-        -- loops, both casting, neither getting a QTE.
-        -- The first attempt at this guard asked "does a driver exist" instead
-        -- and killed auto cast outright - a driver exists whenever the farm is
-        -- on, including when it is sitting idle because the gauge is already
-        -- full or because it cannot find a tower. In "selected" mode that meant
-        -- the one tower the user had picked stopped casting entirely. The flag
-        -- is set only around the rotation itself, so idle means idle
-        if Solver.farming then return end
+        -- AUTO QTE OWNS THIS TOWER, NOT "THE FARM HAPPENS TO BE ROTATING".
+        -- The farm casts the domain and solves every minigame it opens, so a
+        -- press from the auto-cast loop is a second domain 1.2s later: the
+        -- server refuses it and the log fills with `no QTE: server refused`.
+        --
+        -- Two earlier versions of this guard were both wrong in opposite
+        -- directions. The first asked "is a driver thread alive", which was
+        -- false whenever the driver had died - and it died constantly, see the
+        -- generation comment in startAuto - so in "selected" mode the picked
+        -- tower stopped casting entirely. The second narrowed it to
+        -- Solver.farming, which is only set during a rotation, so the auto-cast
+        -- loop got a free hand in every 2..30s pause between rotations: it
+        -- pressed the tower, solveOnce bumped the shared token, and the farm
+        -- exited for good. That is the "one or two minigames and then nothing".
+        --
+        -- Ownership is the right question, not liveness: while the toggle is on,
+        -- a live driver means the farm is responsible for this tower, full
+        -- stop. "Is a driver alive" only became a usable test once the driver
+        -- stopped dying on every token bump and the supervisor started putting
+        -- it back - before that the same test was reading a dead flag.
+        if Solver.driver then
+            if Hub.setStatus then Hub.setStatus("Justice is driven by auto QTE", nil) end
+            return false
+        end
+        -- no driver for this one tick: the supervisor puts one back within a
+        -- second, and a token bump no longer kills the farm, so solving here is
+        -- a duplicate at worst instead of a kill
         solveOnce(entry)
-        return
+        return true
     end
 
     local ok, msg = castEntry(entry)
@@ -3203,7 +3218,10 @@ abilBox:AddButton({
             setStatus("remote missing for " .. tostring(e.attack), "bad")
             return
         end
-        pressEntry(e)
+        -- pressEntry returns false when it declined to cast - auto QTE owns the
+        -- tower, or the tower is blocked. it has already said why in the status
+        -- line, so saying "cast" over the top of that would be a lie
+        if pressEntry(e) == false then return end
         setStatus("cast " .. e.spec.label, "good")
     end,
     DoubleClick = false,
