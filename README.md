@@ -10,6 +10,7 @@ him through portals, into events, and across server hops.
 | `STD_Hub.luau` | the hub itself, ~430 KB, the only thing that draws a window |
 | `STD_Loader.luau` | waits for the server, starts anti-AFK, fetches and runs the hub |
 | `autoexec/STD_Hub.luau` | the only file that goes in the executor's autoexec folder |
+| `Library.lua` | the Obsidian UI library, ~555 KB, vendored so the hub does not depend on somebody else's repo |
 | `sim/` | offline simulations for the loader's fetch path. not shipped to clients |
 
 ## Use
@@ -52,6 +53,45 @@ this hub that still sits in the executor workspace. That ancestor says "STD Hub"
 in its header and would pass a looser check, so the loader would happily run a
 month-old hub and report a successful load. Every build from v7 on carries
 `hub v`; none of the ancestors do.
+
+## The window
+
+The UI library is fetched by the hub itself, before the window is built, from
+this repo first and `deividcomsono/Obsidian` second:
+
+```
+STD-Hub raw  ->  cdn.jsdelivr  ->  fastly.jsdelivr  ->  Obsidian raw  ->  cdn.jsdelivr  ->  STD_Library_cache.lua
+```
+
+Two rounds, then the disk copy. A body has to be at least 100 KB and contain
+`Obsidian`: a truncated library is worse than a missing one, because it compiles
+far enough to start building the window and then dies in the middle of it.
+
+Once the window exists, a supervisor checks it once a second and repairs it. The
+four things that take it off the screen, none of which the hub can otherwise
+notice:
+
+| what happened | what the supervisor does |
+| --- | --- |
+| the ScreenGui was unparented | re-parents it to `gethui()` |
+| the ScreenGui was disabled | re-enables it |
+| something draws above DisplayOrder 998 | raises it to 9999 |
+| the frame is off the viewport | recentres it |
+
+Each repair is logged once, and one line is written at startup with everything
+needed to tell the cases apart:
+
+```
+gui: screen=Obsidian parent=CoreGui enabled=true order=9999 frame=MainFrame
+     visible=true pos=280,60 size=720x600 in-view=720x600 loaded=true coregui=[...]
+```
+
+`loaded=false`, or a loading GUI in `coregui`, means the window is fine and the
+client has not finished joining - the loading screen draws above everything.
+
+**F2** re-shows and re-centres the window. RightShift only toggles visibility,
+which does nothing when what is hidden is a window sitting off the edge of the
+screen.
 
 ## Updating
 
