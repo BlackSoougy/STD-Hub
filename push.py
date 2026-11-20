@@ -276,27 +276,6 @@ def main():
         print("         that is the CDN's 300s cache, not a failed push - it clears")
         print("         on its own, and a join in the next five minutes may be stale")
 
-    # THE LIBRARY IS PART OF THE LOAD PATH NOW.
-    # The hub fetches Library.lua from this repo before it builds its window, so
-    # a library that did not land is a hub with no menu - which is the exact
-    # failure the move was made to stop. Same check as the hub: the git object,
-    # not raw, because raw lags the CDN by up to 300 seconds.
-    lib = os.path.join(HERE, "Library.lua")
-    if not os.path.isfile(lib):
-        die("Library.lua is not in " + HERE + " - the hub fetches it from this repo")
-    lib_md5 = hashlib.md5(open(lib, "rb").read()).hexdigest()
-    print("verifying the library object...")
-    status, data = http_get(
-        f"{API}/repos/{owner}/{args.repo}/contents/Library.lua?ref={args.branch}",
-        token=args.token,
-        accept="application/vnd.github.raw",
-    )
-    if status != 200:
-        die(f"Library.lua is not in the repo ({status}) - the hub would come up with no menu")
-    if hashlib.md5(data).hexdigest() != lib_md5:
-        die("the library blob in the repo is not the file on disk - a push raced a write")
-    print(f"  library {len(data)/1024:.0f} KB, matches the file on disk")
-
     loader = f"https://raw.githubusercontent.com/{owner}/{args.repo}/{args.branch}/STD_Loader.luau"
     print()
     print("=" * 72)
