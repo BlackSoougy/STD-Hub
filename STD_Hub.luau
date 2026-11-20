@@ -10898,7 +10898,14 @@ local function guiGuardStep()
         if ok then
             guiSay("parent", "the ScreenGui had been unparented - re-parented")
         else
+            -- Parent is locked once an instance is destroyed, so this is the one
+            -- case the guard cannot repair: everything below it went with the
+            -- ScreenGui. Said out loud in the console as well as the log, because
+            -- the fix is "load it again" and the player needs to know that
             guiSay("parentfail", "the ScreenGui was unparented and cannot be put back (destroyed)")
+            pcall(function()
+                warn("[STD] the window was destroyed by something outside the hub - load the hub again")
+            end)
         end
     end
 
