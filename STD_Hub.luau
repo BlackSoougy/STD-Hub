@@ -2207,6 +2207,7 @@ local Tabs = {
     Gaunt  = Window:AddTab("Gauntlet",  "crosshair"),
     Raids  = Window:AddTab("Raids",     "skull"),
     Casino = Window:AddTab("Casino",    "dices"),
+    Trait  = Window:AddTab("Traits",    "sparkles"),
     Sukuna = Window:AddTab("Sukuna",    "flame"),
     Story  = Window:AddTab("Story",     "book-open"),
     Place  = Window:AddTab("Place",     "map-pin"),
@@ -10687,6 +10688,576 @@ guardBox:AddLabel("waits 25s after load, then hops on sight or under 8 players",
 
 Guard.start()
 
+--=============================================================
+-- TRAITS  --  automatic reroll for the two trait pools
+--=============================================================
+-- The game has two independent pools and one roller for both:
+--
+--   Cursed       "Binding Vow", the casino   Crystals             1-3 each
+--   Anniversary  the event                   AnniversaryCrystals  2-3 each
+--
+-- Both roll the same way. Traits.RollTrait:InvokeServer(uuid) returns the new
+-- trait id; the client sends only the uuid and the server picks, so there is
+-- nothing to bias from here. What CAN be automated is the loop around it:
+-- roll, read the result, keep it or roll again.
+--
+-- The "are you sure you want to roll X?" popup is CLIENT-SIDE ONLY. The game
+-- asks when the trait you are about to destroy is rarer than the category's
+-- WarnBelowPercent (4% cursed, 5% anniversary) - that is the yellow legendary
+-- case. Calling the remote directly never shows it. That is all the skip
+-- toggle below is, and it says so instead of pretending to press a button.
+--
+-- The whole section is one function call, not a run of top-level locals: this
+-- chunk is already at 187 of the 200 locals Luau allows per function, and six
+-- more names at the end of it is a build that does not load at all
+-- ("Out of local registers when trying to allocate names: exceeded limit 200").
+Hub.TraitRoll = (function()
+local TraitRoll = {}
+
+TraitRoll.CATS = { "Cursed", "Anniversary" }
+
+TraitRoll.META = {
+    Cursed = {
+        title     = "Binding Vow (casino)",
+        short     = "cursed",
+        icon      = "dices",
+        currency  = "Crystals",
+        curLabel  = "cursed crystals",
+        warnBelow = 4,
+    },
+    Anniversary = {
+        title     = "Anniversary (event)",
+        short     = "anniversary",
+        icon      = "gift",
+        currency  = "AnniversaryCrystals",
+        curLabel  = "anniversary crystals",
+        warnBelow = 5,
+    },
+}
+
+-- The pools as they were on 21 Nov. Used only when Configs.Traits cannot be
+-- required, so a hub that loads before the config replicates still shows a
+-- list instead of an empty panel. Rarest first.
+TraitRoll.FALLBACK = {
+    Cursed = {
+        { "HonoredOne",          "The Honored One",      10 },
+        { "HeavenlyRestriction", "Heavenly Restriction", 20 },
+        { "Caster2",             "Caster II",            60 },
+        { "Might",               "Might",               100 },
+        { "Rapid",               "Rapid",               100 },
+        { "Efficiency",          "Efficiency",          100 },
+        { "Caster1",             "Caster I",            110 },
+        { "Summoner",            "Summoner",            325 },
+        { "Fortune",             "Fortune",             325 },
+        { "Power3",              "Power III",           850 },
+        { "Haste3",              "Haste III",           850 },
+        { "Scope3",              "Scope III",           850 },
+        { "Power2",              "Power II",           1000 },
+        { "Haste2",              "Haste II",           1000 },
+        { "Scope2",              "Scope II",           1000 },
+        { "Power1",              "Power I",            1100 },
+        { "Haste1",              "Haste I",            1100 },
+        { "Scope1",              "Scope I",            1100 },
+    },
+    Anniversary = {
+        { "Anni_TheAnniversary",  "The Anniversary",  1 },
+        { "Anni_PrizeWheel",      "Prize Wheel",      3 },
+        { "Anni_MegaMush",        "Mega Mush",        5 },
+        { "Anni_PinataPayday",    "Pinata Payday",   13 },
+        { "Anni_PinataSummons",   "Pinata Summons",  14 },
+        { "Anni_PinataBlessing",  "Pinata Blessing", 20 },
+        { "Anni_PartySniper",     "Party Sniper",   110 },
+        { "Anni_PartyBouncer",    "Party Bouncer",  110 },
+        { "Anni_PartyHat3",       "Party Hat III",  130 },
+        { "Anni_PartyHat2",       "Party Hat II",   249 },
+        { "Anni_PartyHat1",       "Party Hat I",    345 },
+    },
+}
+
+TraitRoll.keep        = { Cursed = {}, Anniversary = {} }
+TraitRoll.running     = { Cursed = false, Anniversary = false }
+TraitRoll.thread      = { Cursed = nil, Anniversary = nil }
+TraitRoll.delay       = { Cursed = 0.4, Anniversary = 0.4 }
+TraitRoll.rolls       = { Cursed = 0, Anniversary = 0 }
+TraitRoll.kept        = { Cursed = 0, Anniversary = 0 }
+TraitRoll.miss        = { Cursed = 0, Anniversary = 0 }
+TraitRoll.skipConfirm = true
+TraitRoll._cat        = nil
+TraitRoll._total      = nil
+TraitRoll._mod        = nil
+TraitRoll._modTried   = false
+
+local KEEP_FILE = "STD_Hub_traits.txt"
+
+-- Configs.Traits is the single source of truth for what a trait is called,
+-- which pool it belongs to and how rare it is. Required once, kept. If it is
+-- not there the fallback tables above answer instead and nothing breaks.
+function TraitRoll.module()
+    if TraitRoll._modTried then return TraitRoll._mod end
+    TraitRoll._modTried = true
+    local ok, m = pcall(function()
+        local c = RS:FindFirstChild("Configs")
+        local t = c and c:FindFirstChild("Traits")
+        if not t then return nil end
+        return require(t)
+    end)
+    if ok and type(m) == "table" then TraitRoll._mod = m end
+    return TraitRoll._mod
+end
+
+function TraitRoll.catalog(cat)
+    TraitRoll._cat = TraitRoll._cat or {}
+    TraitRoll._total = TraitRoll._total or {}
+    if TraitRoll._cat[cat] then return TraitRoll._cat[cat] end
+
+    local list = {}
+    local m = TraitRoll.module()
+    local live = m and type(m.ByCategory) == "table" and m.ByCategory[cat]
+    if type(live) == "table" and #live > 0 then
+        for _, t in ipairs(live) do
+            list[#list + 1] = {
+                id = t.Id, name = t.Name or t.Id,
+                chance = tonumber(t.Chance) or 0, desc = t.Desc,
+            }
+        end
+    else
+        for _, row in ipairs(TraitRoll.FALLBACK[cat] or {}) do
+            list[#list + 1] = { id = row[1], name = row[2], chance = row[3] }
+        end
+    end
+
+    -- rarest first: the top of the list is what you are actually rolling for
+    table.sort(list, function(a, b)
+        if (a.chance or 0) == (b.chance or 0) then
+            return tostring(a.name) < tostring(b.name)
+        end
+        return (a.chance or 0) < (b.chance or 0)
+    end)
+
+    local total = 0
+    for _, t in ipairs(list) do total = total + (t.chance or 0) end
+    TraitRoll._cat[cat], TraitRoll._total[cat] = list, total
+    return list
+end
+
+function TraitRoll.percent(cat, id)
+    local total = TraitRoll._total and TraitRoll._total[cat] or 0
+    if total <= 0 then return 0 end
+    for _, t in ipairs(TraitRoll.catalog(cat)) do
+        if t.id == id then return (t.chance or 0) / total * 100 end
+    end
+    return 0
+end
+
+function TraitRoll.nameOf(cat, id)
+    for _, t in ipairs(TraitRoll.catalog(cat)) do
+        if t.id == id then return t.name end
+    end
+    return nil
+end
+
+-- "11%", "3.3%", "0.10%" - three digits of context without a wall of decimals
+local function pctText(p)
+    if p >= 10 then return ("%.0f%%"):format(p) end
+    if p >= 1 then return ("%.1f%%"):format(p) end
+    return ("%.2f%%"):format(p)
+end
+
+function TraitRoll.categoryOf(id)
+    if id == nil then return nil end
+    local m = TraitRoll.module()
+    if m and type(m.GetCategoryName) == "function" then
+        local ok, c = pcall(m.GetCategoryName, id)
+        if ok and c then return c end
+    end
+    -- prefix fallback: every anniversary trait is Anni_*, every cursed one is not
+    if tostring(id):sub(1, 5) == "Anni_" then return "Anniversary" end
+    return "Cursed"
+end
+
+function TraitRoll.shouldWarn(id)
+    if id == nil then return false end
+    local m = TraitRoll.module()
+    if m and type(m.ShouldWarn) == "function" then
+        local ok, v = pcall(m.ShouldWarn, id)
+        if ok then return v == true end
+    end
+    local cat = TraitRoll.categoryOf(id)
+    local meta = TraitRoll.META[cat]
+    local pct = TraitRoll.percent(cat, id)
+    return meta ~= nil and pct > 0 and pct < meta.warnBelow
+end
+
+function TraitRoll.isOpen(cat)
+    local m = TraitRoll.module()
+    if m and type(m.IsRerollOpen) == "function" then
+        local ok, v = pcall(m.IsRerollOpen, cat)
+        if ok then return v == true end
+    end
+    return true
+end
+
+-- Both price rules come straight out of Configs.Traits (CursedRerollPrice /
+-- AnniversaryRerollPrice), read here instead of called: those two require
+-- another module from inside a closure and throw when the executor calls them
+-- ("Cannot require a non-RobloxScript module from a RobloxScript"). The numbers
+-- are 1-3 crystals either way, so a wrong read could only ever stop the loop
+-- early, never overspend.
+function TraitRoll.price(cat, towerName)
+    local okR, Rarity = pcall(function() return require(RS.Configs.Rarity) end)
+    local okT, Tw = pcall(function() return require(RS.Configs.Towers) end)
+    if not (okR and okT and type(Rarity) == "table" and type(Tw) == "table") then
+        return nil
+    end
+    local cfg = Tw.Config or Tw
+    local entry = cfg[towerName]
+    if type(entry) ~= "table" then return nil end
+    local r = Rarity[entry.Rarity]
+    if type(r) ~= "table" then return nil end
+
+    if cat == "Cursed" then
+        if towerName == "BowSorcererAwk" then return 3 end
+        return tonumber(r.TraitPrice)
+    end
+    if towerName == "BowSorcererAwk" or towerName == "MiracleSorcerer" or towerName == "HarvesterCurse" then
+        return 3
+    end
+    return (tonumber(r.Order) or 0) >= 7 and 3 or 2
+end
+
+function TraitRoll.balance(cat)
+    local d = stateData()
+    local meta = TraitRoll.META[cat]
+    if not d or not meta then return 0 end
+    return tonumber(d[meta.currency]) or 0
+end
+
+local function rollRemote()
+    local r = RS:FindFirstChild("Remotes")
+    local t = r and r:FindFirstChild("Traits")
+    return t and t:FindFirstChild("RollTrait")
+end
+
+-- Towers that still need work: the current trait is in this pool, it is not
+-- one we said to keep, and - unless the popup is being skipped - it is not
+-- something the game itself would warn about losing.
+function TraitRoll.candidates(cat)
+    local out = {}
+    local keep = TraitRoll.keep[cat] or {}
+    for _, t in ipairs(Slots.owned()) do
+        if TraitRoll.categoryOf(t.trait) == cat and not keep[t.trait] then
+            if TraitRoll.skipConfirm or not TraitRoll.shouldWarn(t.trait) then
+                out[#out + 1] = t
+            end
+        end
+    end
+    table.sort(out, function(a, b)
+        if tostring(a.name) == tostring(b.name) then
+            return tostring(a.uuid) < tostring(b.uuid)
+        end
+        return tostring(a.name) < tostring(b.name)
+    end)
+    return out
+end
+
+function TraitRoll.refresh(cat)
+    local lbl = Hub._traitLabel and Hub._traitLabel[cat]
+    if not lbl then return end
+    local meta = TraitRoll.META[cat]
+    local left = #TraitRoll.candidates(cat)
+    pcall(function()
+        lbl:SetText(("%s | %s %d | %d tower(s) left | %d rolled, %d kept"):format(
+            TraitRoll.running[cat] and "ON" or "off",
+            meta.curLabel, TraitRoll.balance(cat), left,
+            TraitRoll.rolls[cat] or 0, TraitRoll.kept[cat] or 0))
+    end)
+end
+
+-- ONE PASS = one roll per tower that still needs it, in name order. A pass is
+-- the unit because rolling one tower until it is perfect spends the whole
+-- balance on the first name in the list; this way every tower improves at the
+-- same rate and the loop ends when the pool is empty, not when it is broke.
+-- Returns ok, reason, retry.
+function TraitRoll.pass(cat, manual)
+    local meta = TraitRoll.META[cat]
+    if not meta then return false, "unknown pool " .. tostring(cat), false end
+    if not TraitRoll.isOpen(cat) then
+        return false, meta.title .. " is closed right now", false
+    end
+    local rem = rollRemote()
+    if not rem then return false, "RollTrait remote is missing", false end
+
+    local list = TraitRoll.candidates(cat)
+    if #list == 0 then
+        return false, "nothing left to roll - every tower already has a kept trait", false
+    end
+
+    for _, t in ipairs(list) do
+        if not manual and not TraitRoll.running[cat] then return false, nil, false end
+        local price = TraitRoll.price(cat, t.name)
+        local bal = TraitRoll.balance(cat)
+        if not price then
+            return false, ("no reroll price for %s - is it still a tower?"):format(tostring(t.name)), false
+        end
+        if bal < price then
+            return false, ("out of %s (%d, next roll costs %d)"):format(meta.curLabel, bal, price), true
+        end
+
+        local ok, res = pcall(function() return rem:InvokeServer(t.uuid) end)
+        TraitRoll.rolls[cat] = (TraitRoll.rolls[cat] or 0) + 1
+        if not ok then
+            return false, "roll refused: " .. tostring(res), false
+        elseif res == nil then
+            -- the server answered but rolled nothing. one of these is a hiccup;
+            -- three in a row means the pool is not taking rolls at all, and a
+            -- loop that keeps asking at full speed is worse than a stop
+            TraitRoll.miss[cat] = (TraitRoll.miss[cat] or 0) + 1
+            if TraitRoll.miss[cat] >= 3 then
+                return false, "the server returned no trait three rolls in a row - stopping", false
+            end
+        else
+            TraitRoll.miss[cat] = 0
+            local id = tostring(res)
+            local keep = TraitRoll.keep[cat] or {}
+            if keep[id] then
+                TraitRoll.kept[cat] = (TraitRoll.kept[cat] or 0) + 1
+                toast(("%s: kept %s on %s"):format(cat, TraitRoll.nameOf(cat, id) or id, tostring(t.name)), 3)
+            end
+        end
+
+        TraitRoll.refresh(cat)
+        task.wait(TraitRoll.delay[cat] or 0.4)
+    end
+    return true, nil, false
+end
+
+function TraitRoll.start(cat)
+    if TraitRoll.running[cat] then return end
+    if not TraitRoll.META[cat] then return end
+    TraitRoll.running[cat] = true
+    TraitRoll.thread[cat] = task.spawn(function()
+        while TraitRoll.running[cat] and getgenv().STD_Hub == Hub do
+            local ok, why, retry = TraitRoll.pass(cat)
+            if not ok then
+                if why then setStatus(cat .. ": " .. why, retry and "info" or "bad") end
+                if not retry then break end
+                -- out of crystals: they come back from quests and dailies, so
+                -- wait for them instead of turning the switch off under you
+                local waited = 0
+                while TraitRoll.running[cat] and waited < 10 do
+                    task.wait(1)
+                    waited = waited + 1
+                end
+            else
+                task.wait(0.2)
+            end
+        end
+        TraitRoll.running[cat] = false
+        TraitRoll.refresh(cat)
+        -- the loop can also end on its own: pool empty, event over, remote
+        -- gone. leaving the switch drawn ON while nothing runs is the kind of
+        -- lie that costs an hour of "why is it not rolling"
+        local w = Options["Auto" .. cat]
+        if w then pcall(function() w:SetValue(false) end) end
+    end)
+end
+
+function TraitRoll.stop(cat)
+    TraitRoll.running[cat] = false
+    TraitRoll.thread[cat] = nil
+    TraitRoll.refresh(cat)
+end
+
+function TraitRoll.stopAll()
+    for _, cat in ipairs(TraitRoll.CATS) do TraitRoll.stop(cat) end
+end
+
+--=============================================================
+-- keep lists: defaults, and a file so a rejoin does not undo them
+--=============================================================
+-- The default is not a taste call: it is everything the game itself would warn
+-- you about losing. Roll into one of those and the loop stops on that tower.
+function TraitRoll.defaultKeep(cat)
+    local set = {}
+    local meta = TraitRoll.META[cat]
+    for _, t in ipairs(TraitRoll.catalog(cat)) do
+        local pct = TraitRoll.percent(cat, t.id)
+        if pct > 0 and pct < (meta and meta.warnBelow or 4) then set[t.id] = true end
+    end
+    return set
+end
+
+function TraitRoll.saveKeep()
+    local lines = {}
+    for _, cat in ipairs(TraitRoll.CATS) do
+        local ids = {}
+        for id in pairs(TraitRoll.keep[cat] or {}) do ids[#ids + 1] = id end
+        table.sort(ids)
+        lines[#lines + 1] = cat .. "=" .. table.concat(ids, ",")
+    end
+    pcall(writefile, KEEP_FILE, table.concat(lines, "\n"))
+end
+
+function TraitRoll.loadKeep()
+    local ok, body = pcall(readfile, KEEP_FILE)
+    if not ok or type(body) ~= "string" or #body == 0 then return false end
+    local found = false
+    for line in body:gmatch("[^\r\n]+") do
+        local cat, rest = line:match("^(%w+)=(.*)$")
+        if cat and TraitRoll.META[cat] then
+            local set = {}
+            for id in rest:gmatch("[^,]+") do
+                if #id > 0 then set[id] = true end
+            end
+            TraitRoll.keep[cat] = set
+            found = true
+        end
+    end
+    return found
+end
+
+-- defaults first, then the file overrides them; both happen before the toggles
+-- are built so each switch starts in the state the list is actually in
+for _, cat in ipairs(TraitRoll.CATS) do
+    TraitRoll.keep[cat] = TraitRoll.defaultKeep(cat)
+end
+TraitRoll.loadKeep()
+
+--=============================================================
+-- the tab
+--=============================================================
+Hub._traitLabel = {}
+
+local function keepToggle(cat, id, name, pct)
+    return function(v)
+        local set = TraitRoll.keep[cat] or {}
+        if v then set[id] = true else set[id] = nil end
+        TraitRoll.keep[cat] = set
+        TraitRoll.saveKeep()
+        TraitRoll.refresh(cat)
+    end
+end
+
+for _, cat in ipairs(TraitRoll.CATS) do
+    local meta = TraitRoll.META[cat]
+    local left = (cat == "Cursed")
+    local box = left and Tabs.Trait:AddLeftGroupbox(meta.title, meta.icon)
+                      or Tabs.Trait:AddRightGroupbox(meta.title, meta.icon)
+    local keepBox = left and Tabs.Trait:AddLeftGroupbox("Keep - " .. meta.short, "check")
+                         or Tabs.Trait:AddRightGroupbox("Keep - " .. meta.short, "check")
+
+    box:AddToggle("Auto" .. cat, {
+        Text = "auto " .. meta.short .. " trait",
+        Default = false,
+        Tooltip = "rolls every tower whose " .. meta.curLabel .. " is not in the keep list, " ..
+                  "one roll per tower per pass, and stops when the balance runs out",
+        Callback = function(v)
+            if v then
+                TraitRoll.start(cat)
+                setStatus(("%s: rolling - %d tower(s) to go"):format(cat, #TraitRoll.candidates(cat)), "info")
+            else
+                -- "stopped" only when something was actually running: the loop
+                -- turns this switch off itself when it ends, and that must not
+                -- overwrite the reason it ended with
+                local was = TraitRoll.running[cat]
+                TraitRoll.stop(cat)
+                if was then setStatus(cat .. ": stopped", "info") end
+            end
+        end,
+    })
+
+    box:AddSlider(cat .. "Delay", {
+        Text = "delay between rolls",
+        Default = 0.4,
+        Min = 0.2,
+        Max = 3,
+        Rounding = 1,
+        Suffix = " s",
+        Tooltip = "the server rolls; this is only how fast the hub asks",
+        Callback = function(v) TraitRoll.delay[cat] = tonumber(v) or 0.4 end,
+    })
+
+    box:AddButton({
+        Text = "ROLL " .. string.upper(cat) .. " ONCE",
+        Func = function()
+            task.spawn(function()
+                local ok, why = TraitRoll.pass(cat, true)
+                if not ok and why then setStatus(cat .. ": " .. why, "bad") end
+                TraitRoll.refresh(cat)
+            end)
+        end,
+        Tooltip = "one pass: a single roll on every tower that still needs it",
+    })
+
+    box:AddDivider()
+    Hub._traitLabel[cat] = box:AddLabel("reading the pool...", true)
+
+    -- one switch per trait rather than a multi-dropdown: this library draws a
+    -- selected dropdown row with the same background as an unselected one, so
+    -- "which of these am I keeping" would be a guess. a switch is not.
+    keepBox:AddLabel("a roll that lands one of these is kept", true)
+    keepBox:AddDivider()
+    for _, t in ipairs(TraitRoll.catalog(cat)) do
+        local pct = TraitRoll.percent(cat, t.id)
+        keepBox:AddToggle("Keep_" .. t.id, {
+            Text = ("%s  %s"):format(t.name, pctText(pct)),
+            Default = (TraitRoll.keep[cat] or {})[t.id] == true,
+            Tooltip = t.desc,
+            Callback = keepToggle(cat, t.id, t.name, pct),
+        })
+    end
+end
+
+local traitShared = Tabs.Trait:AddRightGroupbox("Shared", "sliders")
+
+traitShared:AddToggle("TraitSkipConfirm", {
+    Text = "skip the confirm popup",
+    Default = true,
+    Tooltip = "the game asks \"are you sure?\" before you destroy a trait rarer than " ..
+              "4% (cursed) / 5% (anniversary). the hub calls RollTrait directly and the " ..
+              "popup never appears - with this OFF it leaves those towers alone instead",
+    Callback = function(v)
+        TraitRoll.skipConfirm = v == true
+        for _, cat in ipairs(TraitRoll.CATS) do TraitRoll.refresh(cat) end
+    end,
+})
+
+traitShared:AddButton({
+    Text = "RESET KEEP LISTS",
+    Func = function()
+        for _, cat in ipairs(TraitRoll.CATS) do
+            TraitRoll.keep[cat] = TraitRoll.defaultKeep(cat)
+            for _, t in ipairs(TraitRoll.catalog(cat)) do
+                local w = Options["Keep_" .. t.id]
+                if w then pcall(function() w:SetValue((TraitRoll.keep[cat] or {})[t.id] == true) end) end
+            end
+            TraitRoll.refresh(cat)
+        end
+        TraitRoll.saveKeep()
+        setStatus("trait keep lists reset to the rare ones", "good")
+    end,
+    Tooltip = "back to everything the game itself would warn you about losing",
+})
+
+traitShared:AddButton({
+    Text = "REFRESH",
+    Func = function()
+        for _, cat in ipairs(TraitRoll.CATS) do TraitRoll.refresh(cat) end
+        setStatus("trait counters re-read", "good")
+    end,
+    Tooltip = "re-reads the balance and the towers. if the game added a trait, reload the hub",
+})
+
+traitShared:AddDivider()
+traitShared:AddLabel("the hub rolls through RollTrait, not the roller window,", true)
+traitShared:AddLabel("so the game's confirm popup cannot block it.", true)
+traitShared:AddLabel("towers with no trait need a scroll, not a roll.", true)
+
+for _, cat in ipairs(TraitRoll.CATS) do TraitRoll.refresh(cat) end
+
+return TraitRoll
+end)()
+
 Hub.destroy = function()
     pcall(function() Hub.stopAuto() end)
     pcall(function() Modes.stopAutoStart() end)
@@ -10722,6 +11293,7 @@ Hub.destroy = function()
     pcall(function() Move.stop() end)
     pcall(function() Plaza.stop() end)
     pcall(function() Guard.stop() end)
+    pcall(function() if Hub.TraitRoll then Hub.TraitRoll.stopAll() end end)
     for _, c in ipairs(Hub.conns) do pcall(function() c:Disconnect() end) end
     for _, t in ipairs(Hub.threads) do pcall(function() task.cancel(t) end) end
     for _, t in ipairs(Macros.threads) do pcall(function() task.cancel(t) end) end
