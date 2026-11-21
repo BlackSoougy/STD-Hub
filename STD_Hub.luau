@@ -10782,12 +10782,19 @@ TraitRoll.rolls       = { Cursed = 0, Anniversary = 0 }
 TraitRoll.kept        = { Cursed = 0, Anniversary = 0 }
 TraitRoll.miss        = { Cursed = 0, Anniversary = 0 }
 TraitRoll.skipConfirm = true
+-- which unit to roll: a uuid, or nil for "every tower in this pool". The game's
+-- own roller works on one selected unit, so this is the switch that decides
+-- whether the hub does that or sweeps the whole pool.
+TraitRoll.pick        = { Cursed = nil, Anniversary = nil }
+TraitRoll.pickMap     = { Cursed = {}, Anniversary = {} }
+-- AddToggle hands back the switch but does not put it in Options (only
+-- dropdowns, inputs and sliders land there), so the switches are held here
+TraitRoll.widgets     = { Cursed = { keep = {} }, Anniversary = { keep = {} } }
 TraitRoll._cat        = nil
 TraitRoll._total      = nil
 TraitRoll._mod        = nil
 TraitRoll._modTried   = false
 
-local KEEP_FILE = "STD_Hub_traits.txt"
 
 -- Configs.Traits is the single source of truth for what a trait is called,
 -- which pool it belongs to and how rare it is. Required once, kept. If it is
@@ -10938,14 +10945,70 @@ local function rollRemote()
     return t and t:FindFirstChild("RollTrait")
 end
 
+-- Every owned tower whose CURRENT trait belongs to this pool - the same set the
+-- game's own unit picker shows, because a tower can only be rolled inside the
+-- pool it is already in. Towers with no trait at all are in neither list: those
+-- take a scroll, not a roll.
+function TraitRoll.units(cat)
+    local list, counts, seen = {}, {}, {}
+    for _, t in ipairs(Slots.owned()) do
+        if TraitRoll.categoryOf(t.trait) == cat then
+            counts[t.name] = (counts[t.name] or 0) + 1
+            list[#list + 1] = t
+        end
+    end
+    -- equipped units first: those are the ones actually being played, and with
+    -- seven copies of the same tower the order is the only way to tell them
+    -- apart in the list
+    table.sort(list, function(a, b)
+        local ea, eb = a.equipped and 1 or 0, b.equipped and 1 or 0
+        if ea ~= eb then return ea > eb end
+        if tostring(a.name) == tostring(b.name) then
+            return tostring(a.uuid) < tostring(b.uuid)
+        end
+        return tostring(a.name) < tostring(b.name)
+    end)
+    -- two copies of the same tower are told apart by their order, and the trait
+    -- they carry right now rides along: with seven GunSorcerers in the list the
+    -- trait is the only thing that actually tells them apart
+    for _, t in ipairs(list) do
+        seen[t.name] = (seen[t.name] or 0) + 1
+        local prefix = counts[t.name] > 1 and (tostring(t.name) .. " (" .. seen[t.name] .. ")") or tostring(t.name)
+        t.label = ("%s  %s"):format(prefix, TraitRoll.nameOf(cat, t.trait) or tostring(t.trait))
+    end
+    return list
+end
+
+function TraitRoll.unitOf(cat, uuid)
+    if uuid == nil then return nil end
+    for _, u in ipairs(TraitRoll.units(cat)) do
+        if u.uuid == uuid then return u end
+    end
+    return nil
+end
+
+-- the dropdown's values, and the label -> uuid map its callback needs
+function TraitRoll.labels(cat)
+    local labels = { "all towers" }
+    local map = {}
+    for _, u in ipairs(TraitRoll.units(cat)) do
+        labels[#labels + 1] = u.label
+        map[u.label] = u.uuid
+    end
+    TraitRoll.pickMap[cat] = map
+    return labels
+end
+
 -- Towers that still need work: the current trait is in this pool, it is not
 -- one we said to keep, and - unless the popup is being skipped - it is not
 -- something the game itself would warn about losing.
 function TraitRoll.candidates(cat)
     local out = {}
     local keep = TraitRoll.keep[cat] or {}
+    local pick = TraitRoll.pick[cat]
     for _, t in ipairs(Slots.owned()) do
-        if TraitRoll.categoryOf(t.trait) == cat and not keep[t.trait] then
+        if (pick == nil or t.uuid == pick)
+            and TraitRoll.categoryOf(t.trait) == cat and not keep[t.trait] then
             if TraitRoll.skipConfirm or not TraitRoll.shouldWarn(t.trait) then
                 out[#out + 1] = t
             end
@@ -10964,13 +11027,53 @@ function TraitRoll.refresh(cat)
     local lbl = Hub._traitLabel and Hub._traitLabel[cat]
     if not lbl then return end
     local meta = TraitRoll.META[cat]
-    local left = #TraitRoll.candidates(cat)
+    local pick = TraitRoll.pick[cat]
+    local where
+    if pick then
+        -- the label already carries the trait; appending it again would read
+        -- "GunSorcerer (2)  Power III: Power III"
+        local u = TraitRoll.unitOf(cat, pick)
+        where = u and tostring(u.label) or "that unit is gone"
+    else
+        where = ("%d tower(s) left"):format(#TraitRoll.candidates(cat))
+    end
     pcall(function()
-        lbl:SetText(("%s | %s %d | %d tower(s) left | %d rolled, %d kept"):format(
+        lbl:SetText(("%s | %s %d | %s | %d rolled, %d kept"):format(
             TraitRoll.running[cat] and "ON" or "off",
-            meta.curLabel, TraitRoll.balance(cat), left,
+            meta.curLabel, TraitRoll.balance(cat), where,
             TraitRoll.rolls[cat] or 0, TraitRoll.kept[cat] or 0))
     end)
+    -- the unit list carries each unit's current trait, so it has to be rebuilt
+    -- whenever one of them changes - which is exactly here
+    TraitRoll.relabel(cat)
+end
+
+-- Rebuilds the picker's values in place, keeping the selection. Skipped when no
+-- label actually changed, so a quiet hub does no work.
+function TraitRoll.relabel(cat)
+    local w = Options[cat .. "Pick"]
+    if not w then return end
+    local units = TraitRoll.units(cat)
+    local parts = {}
+    for _, u in ipairs(units) do parts[#parts + 1] = u.label end
+    local sig = table.concat(parts, "|")
+    TraitRoll._sig = TraitRoll._sig or {}
+    if sig == (TraitRoll._sig[cat] or "") then return end
+    TraitRoll._sig[cat] = sig
+
+    local pick = TraitRoll.pick[cat]
+    local labels = TraitRoll.labels(cat)
+    local cur = "all towers"
+    if pick then
+        for _, u in ipairs(units) do
+            if u.uuid == pick then cur = u.label end
+        end
+    end
+    -- SetValue runs the picker's callback, which would re-enter refresh
+    TraitRoll._relabel = true
+    pcall(function() w:SetValues(labels) end)
+    pcall(function() w:SetValue(cur) end)
+    TraitRoll._relabel = false
 end
 
 -- ONE PASS = one roll per tower that still needs it, in name order. A pass is
@@ -10989,7 +11092,26 @@ function TraitRoll.pass(cat, manual)
 
     local list = TraitRoll.candidates(cat)
     if #list == 0 then
-        return false, "nothing left to roll - every tower already has a kept trait", false
+        local pick = TraitRoll.pick[cat]
+        if pick == nil then
+            return false, "nothing left to roll - every tower already has a kept trait", false
+        end
+        -- one unit picked: name the exact reason, because "nothing left" over a
+        -- single selected unit reads like a bug
+        local u = TraitRoll.unitOf(cat, pick)
+        if not u then
+            return false, "that unit is no longer in this pool - pick another", false
+        end
+        local keep = TraitRoll.keep[cat] or {}
+        if keep[u.trait] then
+            return false, ("%s already has %s - that one is a keep"):format(
+                tostring(u.label), TraitRoll.nameOf(cat, u.trait) or tostring(u.trait)), false
+        end
+        if not TraitRoll.skipConfirm and TraitRoll.shouldWarn(u.trait) then
+            return false, ("%s has %s, which the game would ask about - popup skipping is off"):format(
+                tostring(u.label), TraitRoll.nameOf(cat, u.trait) or tostring(u.trait)), false
+        end
+        return false, "nothing to roll on that unit", false
     end
 
     for _, t in ipairs(list) do
@@ -11057,7 +11179,7 @@ function TraitRoll.start(cat)
         -- the loop can also end on its own: pool empty, event over, remote
         -- gone. leaving the switch drawn ON while nothing runs is the kind of
         -- lie that costs an hour of "why is it not rolling"
-        local w = Options["Auto" .. cat]
+        local w = (TraitRoll.widgets[cat] or {}).auto
         if w then pcall(function() w:SetValue(false) end) end
     end)
 end
@@ -11087,66 +11209,76 @@ function TraitRoll.defaultKeep(cat)
     return set
 end
 
-function TraitRoll.saveKeep()
-    local lines = {}
-    for _, cat in ipairs(TraitRoll.CATS) do
-        local ids = {}
-        for id in pairs(TraitRoll.keep[cat] or {}) do ids[#ids + 1] = id end
-        table.sort(ids)
-        lines[#lines + 1] = cat .. "=" .. table.concat(ids, ",")
-    end
-    pcall(writefile, KEEP_FILE, table.concat(lines, "\n"))
-end
-
-function TraitRoll.loadKeep()
-    local ok, body = pcall(readfile, KEEP_FILE)
-    if not ok or type(body) ~= "string" or #body == 0 then return false end
-    local found = false
-    for line in body:gmatch("[^\r\n]+") do
-        local cat, rest = line:match("^(%w+)=(.*)$")
-        if cat and TraitRoll.META[cat] then
-            local set = {}
-            for id in rest:gmatch("[^,]+") do
-                if #id > 0 then set[id] = true end
-            end
-            TraitRoll.keep[cat] = set
-            found = true
-        end
-    end
-    return found
-end
-
--- defaults first, then the file overrides them; both happen before the toggles
--- are built so each switch starts in the state the list is actually in
+-- defaults before the switches are built, so each one starts in the state the
+-- list is actually in. The hub's own persist layer restores whatever the user
+-- changed last time and fires each switch's callback, which is what makes
+-- TraitRoll.keep follow - there is no second file to drift out of sync
 for _, cat in ipairs(TraitRoll.CATS) do
     TraitRoll.keep[cat] = TraitRoll.defaultKeep(cat)
 end
-TraitRoll.loadKeep()
 
 --=============================================================
 -- the tab
 --=============================================================
 Hub._traitLabel = {}
 
-local function keepToggle(cat, id, name, pct)
+-- The switches are the truth, not the table: the set is rebuilt from what is on
+-- screen every time one of them is touched. Mutating the set one id at a time is
+-- what let a spurious callback at build time walk the anniversary list down from
+-- six keeps to one, with the file recording the wreckage on every step.
+function TraitRoll.collect(cat)
+    local set = {}
+    local held = (TraitRoll.widgets[cat] or {}).keep or {}
+    for _, t in ipairs(TraitRoll.catalog(cat)) do
+        local w = held[t.id]
+        if w and w.Value == true then set[t.id] = true end
+    end
+    return set
+end
+
+local function keepToggle(cat)
     return function(v)
-        local set = TraitRoll.keep[cat] or {}
-        if v then set[id] = true else set[id] = nil end
-        TraitRoll.keep[cat] = set
-        TraitRoll.saveKeep()
+        if TraitRoll._uiBuilding then return end
+        TraitRoll.keep[cat] = TraitRoll.collect(cat)
         TraitRoll.refresh(cat)
     end
 end
+
+TraitRoll._uiBuilding = true
 
 for _, cat in ipairs(TraitRoll.CATS) do
     local meta = TraitRoll.META[cat]
     local left = (cat == "Cursed")
     local box = left and Tabs.Trait:AddLeftGroupbox(meta.title, meta.icon)
                       or Tabs.Trait:AddRightGroupbox(meta.title, meta.icon)
-    local keepBox = left and Tabs.Trait:AddLeftGroupbox("Keep - " .. meta.short, "check")
-                         or Tabs.Trait:AddRightGroupbox("Keep - " .. meta.short, "check")
+    local keepBox = left and Tabs.Trait:AddLeftGroupbox("Keep - " .. meta.short, "check-check")
+                         or Tabs.Trait:AddRightGroupbox("Keep - " .. meta.short, "check-check")
 
-    box:AddToggle("Auto" .. cat, {
+    -- the unit picker comes first because it decides what the rest of the box
+    -- does: the game's roller works on one selected unit, so this is the switch
+    -- between "that unit" and "sweep the whole pool"
+    box:AddDropdown(cat .. "Pick", {
+        Text = "unit",
+        Values = TraitRoll.labels(cat),
+        Default = 1,
+        Multi = false,
+        Tooltip = "\"all towers\" rolls every tower in this pool once per pass. " ..
+                  "picking one keeps rolling that unit until it lands a keep",
+        Callback = function(v)
+            if TraitRoll._relabel then return end
+            local uuid = (TraitRoll.pickMap[cat] or {})[tostring(v)]
+            TraitRoll.pick[cat] = uuid
+            TraitRoll.refresh(cat)
+            if uuid then
+                local u = TraitRoll.unitOf(cat, uuid)
+                setStatus(("%s: %s selected"):format(cat, u and u.label or "unit"), "info")
+            else
+                setStatus(cat .. ": all towers", "info")
+            end
+        end,
+    })
+
+    TraitRoll.widgets[cat].auto = box:AddToggle("Auto" .. cat, {
         Text = "auto " .. meta.short .. " trait",
         Default = false,
         Tooltip = "rolls every tower whose " .. meta.curLabel .. " is not in the keep list, " ..
@@ -11199,11 +11331,11 @@ for _, cat in ipairs(TraitRoll.CATS) do
     keepBox:AddDivider()
     for _, t in ipairs(TraitRoll.catalog(cat)) do
         local pct = TraitRoll.percent(cat, t.id)
-        keepBox:AddToggle("Keep_" .. t.id, {
+        TraitRoll.widgets[cat].keep[t.id] = keepBox:AddToggle("Keep_" .. t.id, {
             Text = ("%s  %s"):format(t.name, pctText(pct)),
             Default = (TraitRoll.keep[cat] or {})[t.id] == true,
             Tooltip = t.desc,
-            Callback = keepToggle(cat, t.id, t.name, pct),
+            Callback = keepToggle(cat),
         })
     end
 end
@@ -11225,27 +11357,49 @@ traitShared:AddToggle("TraitSkipConfirm", {
 traitShared:AddButton({
     Text = "RESET KEEP LISTS",
     Func = function()
+        TraitRoll._uiBuilding = true
         for _, cat in ipairs(TraitRoll.CATS) do
             TraitRoll.keep[cat] = TraitRoll.defaultKeep(cat)
             for _, t in ipairs(TraitRoll.catalog(cat)) do
-                local w = Options["Keep_" .. t.id]
+                local w = TraitRoll.widgets[cat].keep[t.id]
                 if w then pcall(function() w:SetValue((TraitRoll.keep[cat] or {})[t.id] == true) end) end
             end
+        end
+        TraitRoll._uiBuilding = false
+        for _, cat in ipairs(TraitRoll.CATS) do
+            TraitRoll.keep[cat] = TraitRoll.collect(cat)
             TraitRoll.refresh(cat)
         end
-        TraitRoll.saveKeep()
         setStatus("trait keep lists reset to the rare ones", "good")
     end,
     Tooltip = "back to everything the game itself would warn you about losing",
 })
 
 traitShared:AddButton({
-    Text = "REFRESH",
+    Text = "RESCAN UNITS",
     Func = function()
-        for _, cat in ipairs(TraitRoll.CATS) do TraitRoll.refresh(cat) end
-        setStatus("trait counters re-read", "good")
+        for _, cat in ipairs(TraitRoll.CATS) do
+            local w = Options[cat .. "Pick"]
+            if w then
+                local labels = TraitRoll.labels(cat)
+                pcall(function() w:SetValues(labels) end)
+                -- keep the selection if that unit is still in this pool, fall
+                -- back to "all towers" if it is not - a stale uuid would roll
+                -- nothing and report "that unit is gone" forever
+                local pick, cur = TraitRoll.pick[cat], "all towers"
+                if pick then
+                    for _, u in ipairs(TraitRoll.units(cat)) do
+                        if u.uuid == pick then cur = u.label end
+                    end
+                end
+                pcall(function() w:SetValue(cur) end)
+            end
+            TraitRoll.refresh(cat)
+        end
+        setStatus("unit list re-read", "good")
     end,
-    Tooltip = "re-reads the balance and the towers. if the game added a trait, reload the hub",
+    Tooltip = "re-reads the towers you own - after buying, selling or evolving one. " ..
+              "the list is otherwise only built when the hub loads",
 })
 
 traitShared:AddDivider()
@@ -11253,7 +11407,16 @@ traitShared:AddLabel("the hub rolls through RollTrait, not the roller window,", 
 traitShared:AddLabel("so the game's confirm popup cannot block it.", true)
 traitShared:AddLabel("towers with no trait need a scroll, not a roll.", true)
 
-for _, cat in ipairs(TraitRoll.CATS) do TraitRoll.refresh(cat) end
+-- the switches are built; from here on a callback means the user pressed
+-- something. resync once from what is actually on screen so the table and the
+-- switches can never disagree
+TraitRoll._uiBuilding = false
+for _, cat in ipairs(TraitRoll.CATS) do
+    TraitRoll.keep[cat] = TraitRoll.collect(cat)
+    TraitRoll._sig = TraitRoll._sig or {}
+    TraitRoll._sig[cat] = nil
+    TraitRoll.refresh(cat)
+end
 
 return TraitRoll
 end)()
