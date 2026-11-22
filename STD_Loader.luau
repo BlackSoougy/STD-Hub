@@ -201,7 +201,7 @@ end
 -- REPO is the only line that needs editing if the repo ever moves.
 local REPO  = "BlackSoougy/STD-Hub"
 local REF   = "main"
-local BUILD = "2026-11-21"
+local BUILD = "2026-11-22"
 
 local CACHE_FILE = "STD_Hub_cache.luau"
 
